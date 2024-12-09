@@ -1,8 +1,14 @@
+from __future__ import annotations
+
 import time
-import redis
+import typing
+from typing import Any
 
 from ..queue import Message, Queue, RichQueue, QueueIsEmpty
 from ..store import MemKey, Store
+
+if typing.TYPE_CHECKING:
+    import redis
 
 # This script takes care of all of the queue semantics beyond at least once delivery
 # - Rate limiting
@@ -89,10 +95,18 @@ redis.call('XDEL', stream, msg_id)
 """
 
 class RedisQueue(Queue):
+    """
+    Single-topic queue on Redis using LPOP and RPUSH
+    """
     client: redis.Redis
     key: str
 
     def __init__(self, client: redis.Redis, key: str):
+        """
+        Bring your own sync Redis client.
+
+        The redis client must be initialized with `decode=True`.
+        """
         self.client = client
         self.key = key
 
@@ -100,11 +114,14 @@ class RedisQueue(Queue):
         self.client.rpush(self.key, message)
 
     def get_message(self) -> Message:
-        message_bytes = self.client.lpop(self.key)
-        if not message_bytes:
+        # This is not an async client
+        ret = typing.cast(list[Any], self.client.blpop([self.key], self.recv_block_secs))
+        if not ret:
             raise QueueIsEmpty
-        message = message_bytes.decode('utf-8')
-        return Message(message, '')
+
+        if not len(ret) >= 2:
+            raise Exception(f"Unexpected length of return value from BLPOP: {len(ret)}")
+        return Message(ret[1], '')
 
     def delete_message(self, receipt_handle: str):
         pass
@@ -154,10 +171,11 @@ class RedisStream(RichQueue):
         argv = self.group, self.consumer, self.rate_limit_pool_capacity, self.replenish_rate_per_second, self.max_concurrency, self.job_timeout_ms
         response = self.client.eval(DEQUEUE_FUNCTION, len(keys), *keys, *argv)
         if not response:
+            # TODO: Do not wait indiscriminately but simulate blpop.  How do you
+            # do that with a script?
             time.sleep(1)
             raise QueueIsEmpty
-        body = response[0].decode('utf-8')
-        receipt_handle = response[1].decode('utf-8')
+        body, receipt_handle = response[:2]
         print(self.client.xpending(self.queue, self.group))
         return Message(body, receipt_handle)
 

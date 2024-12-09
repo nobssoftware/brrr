@@ -1,6 +1,11 @@
-from mypy_boto3_sqs import SQSClient
+from __future__ import annotations
+
+import typing
 
 from ..queue import Queue, Message, QueueIsEmpty
+
+if typing.TYPE_CHECKING:
+    from mypy_boto3_sqs import SQSClient
 
 class SqsQueue(Queue):
     def __init__(self, client: SQSClient, url: str):
@@ -17,7 +22,7 @@ class SqsQueue(Queue):
         response = self.client.receive_message(
             QueueUrl=self.url,
             MaxNumberOfMessages=1,
-            WaitTimeSeconds=3,
+            WaitTimeSeconds=self.recv_block_secs,
         )
 
         if "Messages" not in response:
@@ -37,4 +42,3 @@ class SqsQueue(Queue):
             ReceiptHandle=receipt_handle,
             VisibilityTimeout=seconds
         )
-
