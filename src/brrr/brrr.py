@@ -1,15 +1,13 @@
 from typing import Any, Callable, Union
 
+import logging
 import asyncio
 import threading
-import os
-import http.server
-import socketserver
-import json
-from urllib.parse import parse_qsl
 
-from .store import Call, Frame, Memory, Store, input_hash
-from .queue import Queue, QueueIsEmpty
+from .store import AlreadyExists, Call, CompareMismatch, Memory, Store, input_hash
+from .queue import Queue, QueueIsClosed, QueueIsEmpty
+
+logger = logging.getLogger(__name__)
 
 class Defer(Exception):
     """
@@ -20,13 +18,17 @@ class Defer(Exception):
     def __init__(self, calls: list[Call]):
         self.calls = calls
 
-# Quick n dirty hack to achieve lazy initialization without fully rewriting this
-# entire global using file.  The real solution is to use a singleton and make
-# the top level functions proxies to the singleton.
 class Brrr:
     """
     All state for brrr to function wrapped in a container.
     """
+    def requires_setup(method):
+        def wrapper(self, *args, **kwargs):
+            if self.queue is None or self.memory is None:
+                raise Exception("Brrr not set up")
+            return method(self, *args, **kwargs)
+        return wrapper
+
     # The worker loop (as of writing) is synchronous so it can safely set a
     # local global variable to indicate that it is a worker thread, which, for
     # tasks, means that their Defer raises will be caught and handled by the
@@ -39,9 +41,9 @@ class Brrr:
     # For async workers,
     worker_loops: dict[int, 'Wrrrker']
 
-    # A storage backend for frames, calls and values
+    # A storage backend for calls, values and pending returns
     memory: Memory | None
-    # A queue of frame keys to be processed
+    # A queue of call keys to be processed
     queue: Queue | None
 
     # Dictionary of task_name to task instance
@@ -70,11 +72,6 @@ class Brrr:
         self.queue = queue
         self.memory = Memory(store)
 
-    # TODO would we like this to be a decorator?
-    def require_setup(self):
-        if self.queue is None or self.memory is None:
-            raise Exception("Brrr not set up")
-
     def are_we_inside_worker_context(self):
         if self.worker_singleton:
             return True
@@ -91,14 +88,13 @@ class Brrr:
             return False
 
 
+    @requires_setup
     def gather(self, *task_lambdas) -> list[Any]:
         """
         Takes a number of task lambdas and calls each of them.
         If they've all been computed, return their values,
         Otherwise raise jobs for those that haven't been computed
         """
-        self.require_setup()
-
         if not self.are_we_inside_worker_context():
             return [task_lambda() for task_lambda in task_lambdas]
 
@@ -116,32 +112,54 @@ class Brrr:
 
         return values
 
-    def schedule(self, call: Call, parent_key=None) -> Frame:
-        self.require_setup()
+    def schedule(self, task_name: str, args: tuple, kwargs: dict):
+        """Public-facing one-shot schedule method.
 
+        The exact API for the type of args and kwargs is still WIP.  We're doing
+        (args, kwargs) for now but it's WIP.
+
+        Don't use this internally.
+
+        """
+        return self._schedule_call(Call(task_name, (args, kwargs)))
+
+    @requires_setup
+    def _schedule_call(self, call: Call, parent_key=None):
+        """Schedule this call on the brrr workforce.
+
+        This is the real internal entrypoint which should be used by all brrr
+        internal-facing code, to avoid confusion about what's internal API and
+        what's external.
+
+        """
         # Value has been computed already, return straight to the parent (if there is one)
         if self.memory.has_value(call.memo_key):
             if parent_key is not None:
                 self.queue.put(parent_key)
             return
 
-        # If not, schedule the child. We don't care if it has been scheduled already for now
-        # but we could check, as an optimisation. The set calls are idempotent.
-        self.memory.set_call(call)
-        child = Frame(call.memo_key, parent_key)
-        self.memory.set_frame(child)
-        self.queue.put(child.frame_key)
+        # If this call has previously been scheduled, don't reschedule it
+        if not self.memory.has_call(call):
+            self.memory.set_call(call)
+            self.queue.put(call.memo_key)
 
-        return child
+        if parent_key is not None:
+            self.memory.add_pending_returns(call.memo_key, set([parent_key]))
+
+    @requires_setup
+    def read(self, task_name: str, args: tuple, kwargs: dict):
+        """
+        Returns the value of a task, or raises a KeyError if it's not present in the store
+        """
+        memo_key = Call(task_name, (args, kwargs)).memo_key
+        return self.memory.get_value(memo_key)
 
 
-    def evaluate(self, frame: Frame) -> Any:
+    @requires_setup
+    def evaluate(self, call: Call) -> Any:
         """
         Evaluate a frame, which means calling the tasks function with its arguments
         """
-        self.require_setup()
-
-        call = self.memory.get_call(frame.memo_key)
         task = self.tasks[call.task_name]
         return task.evaluate(call.argv)
 
@@ -154,18 +172,6 @@ class Brrr:
 
     def task(self, fn: Callable, name: str = None) -> 'Task':
         return Task(self, fn, name)
-
-    def srrrv(self, tasks: list['Task'], port: int = int(os.getenv("SRRRVER_PORT", "8333"))):
-        """
-        Spin up a webserver that that translates HTTP requests to tasks
-        """
-        # Srrrver.tasks.update({task.name: task for task in tasks})
-        with socketserver.TCPServer(("", port), Srrrver.subclass_with_brrr(self)) as httpd:
-            print(f"Srrrver running on port {port}")
-            print("Available tasks:")
-            for task in tasks:
-                print("  ", task.name)
-            httpd.serve_forever()
 
     async def wrrrk_async(self, workers: int = 1):
         """
@@ -244,7 +250,8 @@ class Task:
         """
         This puts the task call on the queue, but doesn't return the result!
         """
-        return self.brrr.schedule(Call(self.name, (args, kwargs)))
+        call = Call(self.name, (args, kwargs))
+        return self.brrr._schedule_call(call)
 
 class Wrrrker:
     def __init__(self, brrr: Brrr):
@@ -260,23 +267,58 @@ class Wrrrker:
     def __exit__(self, exc_type, exc_value, traceback):
         self.brrr.worker_singleton = None
 
-    def resolve_frame(self, frame_key: str):
+    def resolve_call(self, memo_key: str):
         """
         A queue message is a frame key and a receipt handle
         The frame key is used to look up the job to be done,
         the receipt handle is used to tell the queue that the job is done
         """
 
-        frame = self.brrr.memory.get_frame(frame_key)
+        call = self.brrr.memory.get_call(memo_key)
+
+        logger.info("Resolving %s %s %s", memo_key, call.task_name, call.argv)
+
         try:
-            self.brrr.memory.set_value(frame.memo_key, self.brrr.evaluate(frame))
-            if frame.parent_key is not None:
-                # This is a redundant step, we could just check the store whether the children have memoized values
-                # frames[frame.parent_key].children[frame_key] = True
-                self.brrr.queue.put(frame.parent_key)
+            value = self.brrr.evaluate(call)
         except Defer as defer:
             for call in defer.calls:
-                self.brrr.schedule(call, frame_key)
+                self.brrr._schedule_call(call, memo_key)
+            return
+
+        # We can end up in a race against another worker to write the value.
+        # We only accept the first entry and the rest will be bounced
+        try:
+            self.brrr.memory.set_value(call.memo_key, value)
+        except AlreadyExists:
+            # It is possible that we can formally prove that this situation means we don't need to
+            # requeue here. Until then, let's just feel safer and run through any pending parents below.
+            pass
+
+        # Now we need to make sure that we enqueue all the parents.
+        # We keep some local state here while we try to compare-and-delete our way out
+        # Due to idempotency, the failure mode is fine here, since we only ever delete
+        # the pending return list after all of themn have been enqueued
+        # For a particularly hot job, it is possible that this gets "stuck" enqueuing
+        # new parents over and over. That is mostly a problem because it could cause
+        # the pending return list to grow out of bounds.
+
+        # TODO This try except jungle needs work. Not sure who wants to throw and who wants to return None
+
+        handled_returns = set()
+        try:
+            all_returns = self.brrr.memory.get_pending_returns(call.memo_key)
+        except KeyError:
+            return
+
+        for memo_key in all_returns - handled_returns:
+            self.brrr.queue.put(memo_key)
+
+        try:
+            self.brrr.memory.delete_pending_returns(call.memo_key, all_returns)
+        except CompareMismatch:
+            # TODO tried to loop here but the dynamo CAS wasn't working. Perhaps revisit at some point
+            # Not required though as the root level task will eventually clean this up
+            pass
 
     # TODO exit when queue empty?
     def loop(self):
@@ -286,29 +328,39 @@ class Wrrrker:
         Managing the output of tasks and scheduling new ones
         """
         with self:
-            print("Worker Started")
+            logger.info("Worker Started")
             while True:
                 try:
                     # This is presumed to be a long poll
                     message = self.brrr.queue.get_message()
                 except QueueIsEmpty:
+                    logger.info("Queue is empty")
                     continue
+                except QueueIsClosed:
+                    logger.info("Queue is closed")
+                    return
 
-                frame_key = message.body
-                self.resolve_frame(frame_key)
+                memo_key = message.body
+                self.resolve_call(memo_key)
 
                 self.brrr.queue.delete_message(message.receipt_handle)
 
     async def loop_async(self):
         with self:
+            logger.info("Worker Started")
             while True:
                 try:
                     message = await self.brrr.queue.get_message_async()
                 except QueueIsEmpty:
+                    logger.info("Queue is empty")
                     continue
+                except QueueIsClosed:
+                    logger.info("Queue is closed")
+                    return
 
-                frame_key = message.body
-                self.resolve_frame(frame_key)
+
+                memo_key = message.body
+                self.resolve_call(memo_key)
 
                 self.brrr.queue.delete_message(message.receipt_handle)
 
@@ -326,83 +378,3 @@ class ThreadWrrrker(Wrrrker):
 
     def __exit__(self, exc_type, exc_value, traceback):
         del self.brrr.worker_threads[threading.current_thread()]
-
-
-# A "Front Office" worker, that is publically exposed and takes requests
-# to schedule tasks and return their results via webhooks
-class Srrrver(http.server.SimpleHTTPRequestHandler):
-    brrr: Brrr
-
-    @classmethod
-    def subclass_with_brrr(cls, brrr: Brrr) -> 'Srrrver':
-        """
-        For some reason the python server class needs to be instantiated without args
-        """
-        return type("SrrrverWithBrrr", (cls,), {"brrr": brrr})
-
-    """
-    A simple HTTP server that takes a JSON payload and schedules a task
-    """
-    def do_GET(self):
-        """
-        GET /task_name?argv={"..."}
-        """
-        task_name = self.path.split("?")[0].strip("/")
-        # TODO parse the argv properly
-        kwargs = dict(parse_qsl(self.path.split("?")[-1]))
-        argv = ((), kwargs)
-
-        try:
-            task = self.brrr.tasks[task_name]
-            call = Call(task.name, argv)
-        except KeyError:
-            self.send_response(404)
-            self.send_header('Content-type', 'application/json')
-            self.end_headers()
-            self.wfile.write(json.dumps({"error": "Task not found"}).encode())
-            return
-
-        try:
-            memo_key = call.memo_key
-            result = self.brrr.memory.get_value(memo_key)
-            self.send_response(200)
-            self.send_header('Content-type', 'application/json')
-            self.end_headers()
-            self.wfile.write(json.dumps({"status": "ok", "result": result}).encode())
-        except KeyError:
-            self.brrr.schedule(call)
-            self.send_response(202)
-            self.send_header('Content-type', 'application/json')
-            self.end_headers()
-            self.wfile.write(json.dumps({"status": "accepted"}).encode())
-            return
-
-    def do_POST(self):
-        """
-        POST /{task_name} with a JSON payload {
-            "args": [],
-            "kwargs": {},
-        }
-
-        """
-        # Custom behavior for POST requests
-        content_length = int(self.headers['Content-Length'])
-        post_data = self.rfile.read(content_length)
-        self.wfile.write(post_data)
-
-        # Schedule a task and submit PUT request to the webhook with the result if one is provided
-        # once it's done
-        try:
-            data = json.loads(post_data)
-            call = Call(data["task_name"], (data["args"], data["kwargs"]))
-            frame = self.brrr.schedule(call)
-            self.send_response(200)
-            self.send_header('Content-type', 'application/json')
-            self.end_headers()
-            error_response = {"status": "OK", "frame_key": frame.frame_key}
-        except json.JSONDecodeError:
-            self.send_response(400)
-            self.send_header('Content-type', 'application/json')
-            self.end_headers()
-            error_response = {"error": "Invalid JSON"}
-            self.wfile.write(json.dumps(error_response))
