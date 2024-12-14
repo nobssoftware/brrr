@@ -11,7 +11,7 @@ import bottle
 
 from brrr.backends import redis as redis_, dynamo
 import brrr
-from brrr import task, wrrrk, setup, brrr
+from brrr import task
 
 @bottle.route("/<task_name>")
 def get_or_schedule_task(task_name: str):
@@ -33,9 +33,6 @@ def get_or_schedule_task(task_name: str):
         return {"status": "accepted"}
 
 def init_brrr(reset_backends):
-    # Check credentials
-    boto3.client('sts').get_caller_identity()
-
     redis_client = redis.Redis(decode_responses=True)
     queue = redis_.RedisStream(redis_client, os.environ.get("REDIS_QUEUE_KEY", "r1"))
     if reset_backends:
@@ -46,14 +43,15 @@ def init_brrr(reset_backends):
     if reset_backends:
         store.create_table()
 
-    setup(queue, store)
+    brrr.setup(queue, store)
 
 @task
 def fib(n: int, salt=None):
     match n:
-        case 0: return 0
-        case 1: return 1
-        case _: return sum(fib.map([[n - 2, salt], [n - 1, salt]]))
+        case 0 | 1:
+            return n
+        case _:
+            return sum(fib.map([[n - 2, salt], [n - 1, salt]]))
 
 @task
 def fib_and_print(n: str, salt = None):
@@ -75,7 +73,7 @@ def cmd(f):
 @cmd
 def worker():
     init_brrr(False)
-    wrrrk(1)
+    brrr.wrrrk(1)
 
 @cmd
 def server():
