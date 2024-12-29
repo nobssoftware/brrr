@@ -64,6 +64,7 @@
           ];
           services = let
             demoEnv = {
+              AWS_DEFAULT_REGION = "us-east-1";
               AWS_ENDPOINT_URL = "http://localhost:8000";
               AWS_ACCESS_KEY_ID = "000000000000";
               AWS_SECRET_ACCESS_KEY = "fake";
@@ -83,6 +84,10 @@
             };
           };
         };
+      };
+      # WIP, exporting is best effort.
+      nixosModules = {
+        brrr-demo = import ./brrr-demo.module.nix;
       };
     };
     perSystem = { config, self', inputs', pkgs, lib, system, ... }: let
@@ -113,6 +118,7 @@
             inputs.services-flake.processComposeModules.default
             self.processComposeModules.default
           ];
+          cli.options.no-server = true;
           services.brrr-demo.server.enable = true;
           services.brrr-demo.worker.enable = true;
         };
@@ -121,6 +127,7 @@
             inputs.services-flake.processComposeModules.default
             self.processComposeModules.default
           ];
+          cli.options.no-server = true;
           services.brrr-demo.server.enable = false;
           services.brrr-demo.worker.enable = false;
         };
@@ -178,14 +185,15 @@
             name = "ruff";
             nativeBuildInputs = [ self'.packages.dev ];
             src = lib.cleanSource ./.;
-            # Don’t check tests for now though we should
             buildPhase = ''
-              ruff check src
+              ruff check
+              ruff format --check
             '';
             installPhase = ''
               touch $out
             '';
           };
+          demoNixosTest = pkgs.callPackage ./brrr-demo.test.nix { inherit self; };
         };
         devshells = {
           impure = {
@@ -231,6 +239,7 @@
               self'.packages.uv
               self'.packages.brrr-demo
               virtualenv
+              pkgs.redis # For the CLI
             ];
             commands = [
               # Always build aarch64-linux

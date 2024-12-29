@@ -2,7 +2,7 @@ on:
   pull_request:
   push:
 
-name: Syntax
+name: CI
 jobs:
   nocommit:
     runs-on: ubuntu-latest
@@ -11,13 +11,26 @@ jobs:
       - name: "nocommit checker"
         uses: nobssoftware/nocommit@v2
 
-  check:
+  nix-flake-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v30
+        with:
+          enable_kvm: true
+          extra_nix_config: "system-features = nixos-test benchmark big-parallel kvm"
+      - name: Configure Nix cache
+        uses: DeterminateSystems/magic-nix-cache-action@main
+      - run: nix flake check -L
+
+  # Ensure nix flake show isn’t broken
+  nix-flake-show:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
       - name: Install Nix
         uses: DeterminateSystems/nix-installer-action@v9
-      - name: Configure Nix cache
-        uses: DeterminateSystems/magic-nix-cache-action@main
-      - run: nix flake check
+      # No need for a cache
+      - run: nix flake show
