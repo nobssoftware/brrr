@@ -1,45 +1,48 @@
-from typing import Any, Callable, Union
-
-import logging
 import asyncio
-import threading
+from collections.abc import Awaitable, Callable, Sequence
+import logging
+from typing import Any, Union
 
 from .store import AlreadyExists, Call, CompareMismatch, Memory, Store, input_hash
 from .queue import Queue, QueueIsClosed, QueueIsEmpty
 
 logger = logging.getLogger(__name__)
 
+# I’d like for the typechecker to raise an error when a value with this type is
+# called as a function without await.  How?
+AsyncFunc = Callable[..., Awaitable[Any]]
+
+
 class Defer(Exception):
     """
     When a task is called and hasn't been computed yet, a Defer exception is raised
     Workers catch this exception and schedule the task to be computed
     """
+
     calls: list[Call]
+
     def __init__(self, calls: list[Call]):
         self.calls = calls
+
 
 class Brrr:
     """
     All state for brrr to function wrapped in a container.
     """
+
     def requires_setup(method):
         def wrapper(self, *args, **kwargs):
             if self.queue is None or self.memory is None:
                 raise Exception("Brrr not set up")
             return method(self, *args, **kwargs)
+
         return wrapper
 
     # The worker loop (as of writing) is synchronous so it can safely set a
     # local global variable to indicate that it is a worker thread, which, for
     # tasks, means that their Defer raises will be caught and handled by the
     # worker
-    worker_singleton: Union['Wrrrker', None]
-
-    # For threaded workers, each worker registers itself in this dict by thread id
-    worker_threads: dict[int, 'Wrrrker']
-
-    # For async workers,
-    worker_loops: dict[int, 'Wrrrker']
+    worker_singleton: Union["Wrrrker", None]
 
     # A storage backend for calls, values and pending returns
     memory: Memory | None
@@ -47,24 +50,13 @@ class Brrr:
     queue: Queue | None
 
     # Dictionary of task_name to task instance
-    tasks = dict[str, 'Task']
+    tasks = dict[str, "Task"]
 
     def __init__(self):
-        self.worker_singleton = None
-        self.worker_threads = {}
-        self.worker_loops = {}
         self.tasks = {}
         self.queue = None
         self.memory = None
-
-    # TODO do we like the idea of brrr as a context manager?
-    def __enter__(self):
-        pass
-    def __exit__(self, exc_type, exc_value, traceback):
-        if hasattr(self.queue, "__exit__"):
-            self.queue.__exit__(exc_type, exc_value, traceback)
-        if hasattr(self.memory, "__exit__"):
-            self.memory.__exit__(exc_type, exc_value, traceback)
+        self.worker_singleton = None
 
     # TODO Do we want to pass in a memstore/kv instead?
     def setup(self, queue: Queue, store: Store):
@@ -72,38 +64,25 @@ class Brrr:
         self.queue = queue
         self.memory = Memory(store)
 
-    def are_we_inside_worker_context(self):
-        if self.worker_singleton:
-            return True
-        elif self.worker_threads:
-            # For synchronous workers, we can use a thread-local global variable
-            return threading.current_thread() in self.worker_threads
-        elif self.worker_loops:
-            try:
-                # For async workers, we can check the asyncio loop
-                return asyncio.get_running_loop() in self.worker_loops
-            except RuntimeError:
-                return False
-        else:
-            return False
-
+    def are_we_inside_worker_context(self) -> Any:
+        return self.worker_singleton
 
     @requires_setup
-    def gather(self, *task_lambdas) -> list[Any]:
+    async def gather(self, *task_lambdas) -> Sequence[Any]:
         """
         Takes a number of task lambdas and calls each of them.
         If they've all been computed, return their values,
         Otherwise raise jobs for those that haven't been computed
         """
         if not self.are_we_inside_worker_context():
-            return [task_lambda() for task_lambda in task_lambdas]
+            return await asyncio.gather(*(f() for f in task_lambdas))
 
         defers = []
         values = []
 
         for task_lambda in task_lambdas:
             try:
-                values.append(task_lambda())
+                values.append(await task_lambda())
             except Defer as d:
                 defers.extend(d.calls)
 
@@ -112,7 +91,7 @@ class Brrr:
 
         return values
 
-    def schedule(self, task_name: str, args: tuple, kwargs: dict):
+    async def schedule(self, task_name: str, args: tuple, kwargs: dict):
         """Public-facing one-shot schedule method.
 
         The exact API for the type of args and kwargs is still WIP.  We're doing
@@ -121,10 +100,10 @@ class Brrr:
         Don't use this internally.
 
         """
-        return self._schedule_call(Call(task_name, (args, kwargs)))
+        return await self._schedule_call(Call(task_name, (args, kwargs)))
 
     @requires_setup
-    def _schedule_call(self, call: Call, parent_key=None):
+    async def _schedule_call(self, call: Call, parent_key=None):
         """Schedule this call on the brrr workforce.
 
         This is the real internal entrypoint which should be used by all brrr
@@ -133,63 +112,50 @@ class Brrr:
 
         """
         # Value has been computed already, return straight to the parent (if there is one)
-        if self.memory.has_value(call.memo_key):
+        if await self.memory.has_value(call.memo_key):
             if parent_key is not None:
-                self.queue.put(parent_key)
+                await self.queue.put(parent_key)
             return
 
         # If this call has previously been scheduled, don't reschedule it
-        if not self.memory.has_call(call):
-            self.memory.set_call(call)
-            self.queue.put(call.memo_key)
+        if not await self.memory.has_call(call):
+            await self.memory.set_call(call)
+            await self.queue.put(call.memo_key)
 
         if parent_key is not None:
-            self.memory.add_pending_returns(call.memo_key, set([parent_key]))
+            await self.memory.add_pending_returns(call.memo_key, set([parent_key]))
 
     @requires_setup
-    def read(self, task_name: str, args: tuple, kwargs: dict):
+    async def read(self, task_name: str, args: tuple, kwargs: dict):
         """
         Returns the value of a task, or raises a KeyError if it's not present in the store
         """
         memo_key = Call(task_name, (args, kwargs)).memo_key
-        return self.memory.get_value(memo_key)
-
+        return await self.memory.get_value(memo_key)
 
     @requires_setup
-    def evaluate(self, call: Call) -> Any:
+    async def evaluate(self, call: Call) -> Any:
         """
         Evaluate a frame, which means calling the tasks function with its arguments
         """
         task = self.tasks[call.task_name]
-        return task.evaluate(call.argv)
+        return await task.evaluate(call.argv)
 
-    def register_task(self, fn: Callable, name: str = None) -> 'Task':
+    def register_task(self, fn: AsyncFunc, name: str = None) -> "Task":
         task = Task(self, fn, name)
         if task.name in self.tasks:
             raise Exception(f"Task {task.name} already exists")
         self.tasks[task.name] = task
         return task
 
-    def task(self, fn: Callable, name: str = None) -> 'Task':
+    def task(self, fn: AsyncFunc, name: str = None) -> "Task":
         return Task(self, fn, name)
 
-    async def wrrrk_async(self, workers: int = 1):
+    async def wrrrk(self):
         """
-        Start a number of async worker loops
+        Spin up a single brrr worker.
         """
-        await asyncio.gather(
-            *(Wrrrker(self).loop_async() for _ in range(workers))
-        )
-
-    def wrrrk(self, threads: int = 1):
-        """
-        Spin up a number of worker threads
-        """
-        if threads == 1:
-            Wrrrker(self).loop()
-        else:
-            for _ in range(threads):
-                threading.Thread(target=Wrrrker(self).loop).start()
+        await Wrrrker(self).loop()
 
 
 class Task:
@@ -201,24 +167,24 @@ class Task:
     A task can not write to the store, only read from it
     """
 
-    fn: Any
+    fn: AsyncFunc
     name: str
     brrr: Brrr
 
-    def __init__(self, brrr: Brrr, fn, name: str = None):
+    def __init__(self, brrr: Brrr, fn: AsyncFunc, name: str = None):
         self.brrr = brrr
         self.fn = fn
         self.name = name or fn.__name__
 
     # Calling a function returns the value if it has already been computed.
     # Otherwise, it raises a Call exception to schedule the computation
-    def __call__(self, *args, **kwargs):
+    async def __call__(self, *args, **kwargs):
         argv = (args, kwargs)
         if not self.brrr.are_we_inside_worker_context():
-            return self.evaluate(argv)
+            return await self.evaluate(argv)
         memo_key = input_hash(self.name, argv)
         try:
-            return self.brrr.memory.get_value(memo_key)
+            return await self.brrr.memory.get_value(memo_key)
         except KeyError:
             raise Defer([Call(self.name, argv)])
 
@@ -228,7 +194,7 @@ class Task:
         """
         return lambda: self(*args, **kwargs)
 
-    def map(self, args: list[Union[dict, list, tuple[tuple, dict]]]):
+    async def map(self, args: list[Union[dict, list, tuple[tuple, dict]]]):
         """
         Fanning out, a map function returns the values if they have already been computed.
         Otherwise, it raises a list of Call exceptions to schedule the computation,
@@ -238,20 +204,31 @@ class Task:
         #TODO we _could_ support a list of elements to get passed as a single arg each
         """
         argvs = [
-            (arg, {}) if isinstance(arg, list) else ((), arg) if isinstance(arg, dict) else arg
+            (arg, {})
+            if isinstance(arg, list)
+            else ((), arg)
+            if isinstance(arg, dict)
+            else arg
             for arg in args
         ]
-        return self.brrr.gather(*(self.to_lambda(*argv[0], **argv[1]) for argv in argvs))
+        return await self.brrr.gather(
+            *(self.to_lambda(*argv[0], **argv[1]) for argv in argvs)
+        )
 
-    def evaluate(self, argv):
-        return self.fn(*argv[0], **argv[1])
+    # I think /technically/ the async + await here cancel each other out and you
+    # could do without either, but there are so many gotchas around it and
+    # possible points of failure that it’s nice to at least ensure this _is_ a
+    # coroutine.
+    async def evaluate(self, argv):
+        return await self.fn(*argv[0], **argv[1])
 
-    def schedule(self, *args, **kwargs):
+    async def schedule(self, *args, **kwargs):
         """
         This puts the task call on the queue, but doesn't return the result!
         """
         call = Call(self.name, (args, kwargs))
-        return self.brrr._schedule_call(call)
+        return await self.brrr._schedule_call(call)
+
 
 class Wrrrker:
     def __init__(self, brrr: Brrr):
@@ -267,28 +244,35 @@ class Wrrrker:
     def __exit__(self, exc_type, exc_value, traceback):
         self.brrr.worker_singleton = None
 
-    def resolve_call(self, memo_key: str):
+    async def resolve_call(self, memo_key: str):
         """
         A queue message is a frame key and a receipt handle
         The frame key is used to look up the job to be done,
         the receipt handle is used to tell the queue that the job is done
         """
 
-        call = self.brrr.memory.get_call(memo_key)
+        call = await self.brrr.memory.get_call(memo_key)
 
         logger.info("Resolving %s %s %s", memo_key, call.task_name, call.argv)
 
         try:
-            value = self.brrr.evaluate(call)
+            value = await self.brrr.evaluate(call)
         except Defer as defer:
+            logger.debug(
+                "Deferring %s %s %s: %d missing calls",
+                memo_key,
+                call.task_name,
+                call.argv,
+                len(defer.calls),
+            )
             for call in defer.calls:
-                self.brrr._schedule_call(call, memo_key)
+                await self.brrr._schedule_call(call, memo_key)
             return
 
         # We can end up in a race against another worker to write the value.
         # We only accept the first entry and the rest will be bounced
         try:
-            self.brrr.memory.set_value(call.memo_key, value)
+            await self.brrr.memory.set_value(call.memo_key, value)
         except AlreadyExists:
             # It is possible that we can formally prove that this situation means we don't need to
             # requeue here. Until then, let's just feel safer and run through any pending parents below.
@@ -306,22 +290,21 @@ class Wrrrker:
 
         handled_returns = set()
         try:
-            all_returns = self.brrr.memory.get_pending_returns(call.memo_key)
+            all_returns = await self.brrr.memory.get_pending_returns(call.memo_key)
         except KeyError:
             return
 
         for memo_key in all_returns - handled_returns:
-            self.brrr.queue.put(memo_key)
+            await self.brrr.queue.put(memo_key)
 
         try:
-            self.brrr.memory.delete_pending_returns(call.memo_key, all_returns)
+            await self.brrr.memory.delete_pending_returns(call.memo_key, all_returns)
         except CompareMismatch:
             # TODO tried to loop here but the dynamo CAS wasn't working. Perhaps revisit at some point
             # Not required though as the root level task will eventually clean this up
             pass
 
-    # TODO exit when queue empty?
-    def loop(self):
+    async def loop(self):
         """
         Workers take jobs from the queue, one at a time, and handle them.
         They have read and write access to the store, and are responsible for
@@ -332,49 +315,15 @@ class Wrrrker:
             while True:
                 try:
                     # This is presumed to be a long poll
-                    message = self.brrr.queue.get_message()
+                    message = await self.brrr.queue.get_message()
                 except QueueIsEmpty:
-                    logger.info("Queue is empty")
+                    logger.debug("Queue is empty")
                     continue
                 except QueueIsClosed:
                     logger.info("Queue is closed")
                     return
 
                 memo_key = message.body
-                self.resolve_call(memo_key)
+                await self.resolve_call(memo_key)
 
-                self.brrr.queue.delete_message(message.receipt_handle)
-
-    async def loop_async(self):
-        with self:
-            logger.info("Worker Started")
-            while True:
-                try:
-                    message = await self.brrr.queue.get_message_async()
-                except QueueIsEmpty:
-                    logger.info("Queue is empty")
-                    continue
-                except QueueIsClosed:
-                    logger.info("Queue is closed")
-                    return
-
-
-                memo_key = message.body
-                self.resolve_call(memo_key)
-
-                self.brrr.queue.delete_message(message.receipt_handle)
-
-
-class ThreadWrrrker(Wrrrker):
-    # The context manager maintains a thread-local global variable to indicate that the thread is a worker
-    # and that any invoked tasks can raise Defer exceptions
-    def __enter__(self):
-        tid = threading.current_thread()
-        if tid in self.brrr.worker_threads:
-            raise Exception("Worker already running in this thread")
-
-        self.brrr.worker_threads[tid] = self
-        return self
-
-    def __exit__(self, exc_type, exc_value, traceback):
-        del self.brrr.worker_threads[threading.current_thread()]
+                await self.brrr.queue.delete_message(message.receipt_handle)
