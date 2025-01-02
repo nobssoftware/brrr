@@ -178,7 +178,7 @@ class Task:
 
     # Calling a function returns the value if it has already been computed.
     # Otherwise, it raises a Call exception to schedule the computation
-    async def __acall__(self, *args, **kwargs):
+    async def __call__(self, *args, **kwargs):
         argv = (args, kwargs)
         if not self.brrr.are_we_inside_worker_context():
             return await self.evaluate(argv)
@@ -194,7 +194,7 @@ class Task:
         """
         return lambda: self(*args, **kwargs)
 
-    def map(self, args: list[Union[dict, list, tuple[tuple, dict]]]):
+    async def map(self, args: list[Union[dict, list, tuple[tuple, dict]]]):
         """
         Fanning out, a map function returns the values if they have already been computed.
         Otherwise, it raises a list of Call exceptions to schedule the computation,
@@ -211,7 +211,7 @@ class Task:
             else arg
             for arg in args
         ]
-        return self.brrr.gather(
+        return await self.brrr.gather(
             *(self.to_lambda(*argv[0], **argv[1]) for argv in argvs)
         )
 

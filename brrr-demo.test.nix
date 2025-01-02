@@ -79,19 +79,22 @@ pkgs.testers.runNixOSTest {
     };
   };
   # Separate node entirely just for the actual testing
-  nodes.tester = { config, pkgs, ... }: {
-    environment.systemPackages = let
-      test-script = pkgs.writeShellApplication {
-        name = "test-brrr-demo";
-        runtimeInputs = with pkgs; [ curl jq ];
-        # 😂
-        text = ''
-          eval "$(curl --fail -sSL "http://server:8080/hello?greetee=Jim" | jq '. == {status: "ok", result: "Hello, Jim!"}')"
-        '';
-      };
-    in [
+  nodes.tester = { config, pkgs, ... }: let
+    test-script = pkgs.writeShellApplication {
+      name = "test-brrr-demo";
+      # 😂
+      text = ''
+        eval "$(curl --fail -sSL "http://server:8080/hello?greetee=Jim" | jq '. == {status: "ok", result: "Hello, Jim!"}')"
+        eval "$(curl --fail -sSL "http://server:8080/fib_and_print?n=6&salt=abcd" | jq '. == {status: "ok", result: 8}')"
+      '';
+    };
+  in {
+    environment.systemPackages = [
       test-script
-    ];
+    ] ++ (with pkgs; [
+      curl
+      jq
+    ]);
   };
 
   globalTimeout = 2 * 60;
@@ -104,7 +107,8 @@ pkgs.testers.runNixOSTest {
     worker.wait_for_unit("default.target")
     tester.wait_for_unit("default.target")
     server.wait_for_open_port(8080)
-    # N.B. the heresy
+    tester.wait_until_succeeds("curl --fail -sSL -X POST 'http://server:8080/hello?greetee=Jim'")
+    tester.wait_until_succeeds("curl --fail -sSL -X POST 'http://server:8080/fib_and_print?n=6&salt=abcd'")
     tester.wait_until_succeeds("test-brrr-demo")
   '';
 }

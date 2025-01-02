@@ -22,6 +22,7 @@ import brrr
 from brrr import task
 
 logger = logging.getLogger(__name__)
+routes = web.RouteTableDef()
 
 
 def table_name() -> str:
@@ -35,10 +36,8 @@ def response(status: int, content: dict):
     return web.Response(status=status, text=json.dumps(content))
 
 
-async def handler(request: web.BaseRequest):
-    """
-    GET /task_name?argv={"..."}
-    """
+@routes.get("/{task_name}")
+async def get_task_result(request: web.BaseRequest):
     # aiohttp uses a multidict but we don’t need that for this demo.
     kwargs = dict(request.query)
 
@@ -49,9 +48,20 @@ async def handler(request: web.BaseRequest):
     try:
         result = await brrr.read(task_name, (), kwargs)
     except KeyError:
-        await brrr.schedule(task_name, (), kwargs)
-        return response(202, {"status": "accepted"})
-    return response(200, {"status": "ok", "result": result})
+        return response(404, dict(error="No result for this task"))
+    return response(200, dict(status="ok", result=result))
+
+
+@routes.post("/{task_name}")
+async def schedule_task(request: web.BaseRequest):
+    kwargs = dict(request.query)
+
+    task_name = request.match_info["task_name"]
+    if task_name not in brrr.tasks:
+        return response(404, {"error": "No such task"})
+
+    await brrr.schedule(task_name, (), kwargs)
+    return response(202, {"status": "accepted"})
 
 
 # ... where is the python contextmanager monad?
@@ -116,7 +126,7 @@ async def fib(n: int, salt=None):
 
 @task
 async def fib_and_print(n: str, salt=None):
-    f = fib(int(n), salt)
+    f = await fib(int(n), salt)
     print(f"fib({n}) = {f}", flush=True)
     return f
 
@@ -148,7 +158,7 @@ async def server():
     bind_port = int(os.environ.get("BRRR_DEMO_LISTEN_PORT", "8080"))
     async with with_brrr(True):
         app = web.Application()
-        app.add_routes([web.get("/{task_name}", handler)])
+        app.add_routes(routes)
         runner = web.AppRunner(app)
         await runner.setup()
         site = web.TCPSite(runner, bind_addr, bind_port)
