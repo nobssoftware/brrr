@@ -1,9 +1,17 @@
+from __future__ import annotations
+
 import asyncio
 from collections.abc import Awaitable, Callable, Sequence
 import logging
 from typing import Any, Union
 
-from .store import AlreadyExists, Call, CompareMismatch, Memory, Store, input_hash
+from .store import (
+    AlreadyExists,
+    Call,
+    Memory,
+    Store,
+    PickleCodec,
+)
 from .queue import Queue, QueueIsClosed, QueueIsEmpty
 
 logger = logging.getLogger(__name__)
@@ -42,7 +50,7 @@ class Brrr:
     # local global variable to indicate that it is a worker thread, which, for
     # tasks, means that their Defer raises will be caught and handled by the
     # worker
-    worker_singleton: Union["Wrrrker", None]
+    worker_singleton: Union[Wrrrker, None]
 
     # A storage backend for calls, values and pending returns
     memory: Memory | None
@@ -50,7 +58,7 @@ class Brrr:
     queue: Queue | None
 
     # Dictionary of task_name to task instance
-    tasks = dict[str, "Task"]
+    tasks: dict[str, Task]
 
     def __init__(self):
         self.tasks = {}
@@ -62,12 +70,12 @@ class Brrr:
     def setup(self, queue: Queue, store: Store):
         # TODO throw if already instantiated?
         self.queue = queue
-        self.memory = Memory(store)
+        self._codec = PickleCodec()
+        self.memory = Memory(store, self._codec)
 
     def are_we_inside_worker_context(self) -> Any:
         return self.worker_singleton
 
-    @requires_setup
     async def gather(self, *task_lambdas) -> Sequence[Any]:
         """
         Takes a number of task lambdas and calls each of them.
@@ -91,6 +99,7 @@ class Brrr:
 
         return values
 
+    @requires_setup
     async def schedule(self, task_name: str, args: tuple, kwargs: dict):
         """Public-facing one-shot schedule method.
 
@@ -100,37 +109,62 @@ class Brrr:
         Don't use this internally.
 
         """
-        return await self._schedule_call(Call(task_name, (args, kwargs)))
+        call = self.memory.make_call(task_name, (args, kwargs))
+        if await self.memory.has_value(call.memo_key):
+            return
+
+        return await self._schedule_call_root(call)
 
     @requires_setup
-    async def _schedule_call(self, call: Call, parent_key=None):
+    async def _schedule_call_nested(self, call: Call, parent_key: str):
         """Schedule this call on the brrr workforce.
 
         This is the real internal entrypoint which should be used by all brrr
         internal-facing code, to avoid confusion about what's internal API and
         what's external.
 
-        """
-        # Value has been computed already, return straight to the parent (if there is one)
-        if await self.memory.has_value(call.memo_key):
-            if parent_key is not None:
-                await self.queue.put(parent_key)
-            return
+        This method is for calls which are scheduled from within another brrr
+        call, i.e. when this call completes it must kick off the parent.
 
-        # If this call has previously been scheduled, don't reschedule it
-        if not await self.memory.has_call(call):
-            await self.memory.set_call(call)
+        This will always kick off the call, it doesn't check if a return value
+        already exists for this call.
+
+        """
+        # First the call because it is perennial, it just describes the actual
+        # call being made, it doesn’t cause any further action and it’s safe
+        # under all races.
+        await self.memory.set_call(call)
+        # Note this can be immediately read out by a racing return call. The
+        # pathological case is: we are late to a party and another worker is
+        # actually just done handling this call, and just before it reads out
+        # the addresses to which to return, it is added here.  That’s still OK
+        # because it will then immediately call this parent flow back, which is
+        # fine because the result does in fact exist.
+        if not await self.memory.add_pending_return(call.memo_key, parent_key):
+            # Even in the previous race scenario this is safe because it just
+            # leads to extra, duplicate, ignored work.
             await self.queue.put(call.memo_key)
 
-        if parent_key is not None:
-            await self.memory.add_pending_returns(call.memo_key, set([parent_key]))
+    @requires_setup
+    async def _schedule_call_root(self, call: Call):
+        """Schedule this call on the brrr workforce.
+
+        This is the real internal entrypoint which should be used by all brrr
+        internal-facing code, to avoid confusion about what's internal API and
+        what's external.
+
+        This method should be called for top-level workflow calls only.
+
+        """
+        await self.memory.set_call(call)
+        await self.queue.put(call.memo_key)
 
     @requires_setup
     async def read(self, task_name: str, args: tuple, kwargs: dict):
         """
         Returns the value of a task, or raises a KeyError if it's not present in the store
         """
-        memo_key = Call(task_name, (args, kwargs)).memo_key
+        memo_key = self.memory.make_call(task_name, (args, kwargs)).memo_key
         return await self.memory.get_value(memo_key)
 
     @requires_setup
@@ -141,14 +175,14 @@ class Brrr:
         task = self.tasks[call.task_name]
         return await task.evaluate(call.argv)
 
-    def register_task(self, fn: AsyncFunc, name: str = None) -> "Task":
+    def register_task(self, fn: AsyncFunc, name: str = None) -> Task:
         task = Task(self, fn, name)
         if task.name in self.tasks:
             raise Exception(f"Task {task.name} already exists")
         self.tasks[task.name] = task
         return task
 
-    def task(self, fn: AsyncFunc, name: str = None) -> "Task":
+    def task(self, fn: AsyncFunc, name: str = None) -> Task:
         return Task(self, fn, name)
 
     async def wrrrk(self):
@@ -182,11 +216,11 @@ class Task:
         argv = (args, kwargs)
         if not self.brrr.are_we_inside_worker_context():
             return await self.evaluate(argv)
-        memo_key = input_hash(self.name, argv)
+        call = self.brrr.memory.make_call(self.name, argv)
         try:
-            return await self.brrr.memory.get_value(memo_key)
+            return await self.brrr.memory.get_value(call.memo_key)
         except KeyError:
-            raise Defer([Call(self.name, argv)])
+            raise Defer([call])
 
     def to_lambda(self, *args, **kwargs):
         """
@@ -226,8 +260,7 @@ class Task:
         """
         This puts the task call on the queue, but doesn't return the result!
         """
-        call = Call(self.name, (args, kwargs))
-        return await self.brrr._schedule_call(call)
+        return await self.brrr.schedule(self.name, args, kwargs)
 
 
 class Wrrrker:
@@ -266,7 +299,7 @@ class Wrrrker:
                 len(defer.calls),
             )
             for call in defer.calls:
-                await self.brrr._schedule_call(call, memo_key)
+                await self.brrr._schedule_call_nested(call, memo_key)
             return
 
         # We can end up in a race against another worker to write the value.
@@ -274,35 +307,15 @@ class Wrrrker:
         try:
             await self.brrr.memory.set_value(call.memo_key, value)
         except AlreadyExists:
-            # It is possible that we can formally prove that this situation means we don't need to
-            # requeue here. Until then, let's just feel safer and run through any pending parents below.
+            # It is possible that we can formally prove that this situation
+            # means we don't need to requeue here. Until then, let's just feel
+            # safer and run through any pending parents below.
             pass
 
-        # Now we need to make sure that we enqueue all the parents.
-        # We keep some local state here while we try to compare-and-delete our way out
-        # Due to idempotency, the failure mode is fine here, since we only ever delete
-        # the pending return list after all of themn have been enqueued
-        # For a particularly hot job, it is possible that this gets "stuck" enqueuing
-        # new parents over and over. That is mostly a problem because it could cause
-        # the pending return list to grow out of bounds.
-
-        # TODO This try except jungle needs work. Not sure who wants to throw and who wants to return None
-
-        handled_returns = set()
-        try:
-            all_returns = await self.brrr.memory.get_pending_returns(call.memo_key)
-        except KeyError:
-            return
-
-        for memo_key in all_returns - handled_returns:
-            await self.brrr.queue.put(memo_key)
-
-        try:
-            await self.brrr.memory.delete_pending_returns(call.memo_key, all_returns)
-        except CompareMismatch:
-            # TODO tried to loop here but the dynamo CAS wasn't working. Perhaps revisit at some point
-            # Not required though as the root level task will eventually clean this up
-            pass
+        async with self.brrr.memory.with_pending_returns_remove(
+            call.memo_key
+        ) as returns:
+            await asyncio.gather(*map(self.brrr.queue.put, returns))
 
     async def loop(self):
         """
