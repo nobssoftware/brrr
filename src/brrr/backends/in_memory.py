@@ -1,8 +1,14 @@
+from __future__ import annotations
+
 import collections
+import typing
 
 from brrr.store import CompareMismatch
 from ..queue import Queue, Message, QueueInfo, QueueIsClosed, QueueIsEmpty
-from ..store import Store
+from ..store import Cache, MemKey, Store
+
+if typing.TYPE_CHECKING:
+    from typing import Any
 
 
 class InMemoryQueue(Queue):
@@ -13,6 +19,9 @@ class InMemoryQueue(Queue):
     messages = collections.deque()
     closed = False
 
+    def __init__(self):
+        self.i = 0
+
     async def put(self, body: str):
         self.messages.append(body)
 
@@ -21,7 +30,8 @@ class InMemoryQueue(Queue):
             raise QueueIsClosed
         if not self.messages:
             raise QueueIsEmpty
-        return Message(self.messages.popleft(), "")
+        self.i += 1
+        return Message(self.messages.popleft(), str(self.i))
 
     async def delete_message(self, receipt_handle: str):
         pass
@@ -36,43 +46,55 @@ class InMemoryQueue(Queue):
         pass
 
 
+def _key2str(key: MemKey) -> str:
+    return f"{key.type}/{key.id}"
+
+
 # Just to drive the point home
-class InMemoryByteStore(Store):
+class InMemoryByteStore(Store, Cache):
     """
     A store that stores bytes
     """
 
-    inner: dict
+    inner: dict[str, Any]
 
     def __init__(self):
         self.inner = {}
 
-    async def has(self, key: str) -> bool:
-        return key in self.inner
+    async def has(self, key: MemKey) -> bool:
+        return _key2str(key) in self.inner
 
-    async def get(self, key: str) -> bytes:
-        return self.inner[key]
+    async def get(self, key: MemKey) -> bytes:
+        return self.inner[_key2str(key)]
 
-    async def set(self, key: str, value: bytes):
-        self.inner[key] = value
+    async def set(self, key: MemKey, value: bytes):
+        self.inner[_key2str(key)] = value
 
-    async def delete(self, key: str):
+    async def delete(self, key: MemKey):
         try:
-            del self.inner[key]
+            del self.inner[_key2str(key)]
         except KeyError:
             pass
 
-    async def set_new_value(self, key: str, value: bytes):
-        if key in self.inner:
+    async def set_new_value(self, key: MemKey, value: bytes):
+        k = _key2str(key)
+        if k in self.inner:
             raise CompareMismatch
-        self.inner[key] = value
+        self.inner[k] = value
 
-    async def compare_and_set(self, key: str, value: bytes, expected: bytes):
-        if (key not in self.inner) or (self.inner[key] != expected):
+    async def compare_and_set(self, key: MemKey, value: bytes, expected: bytes):
+        k = _key2str(key)
+        if (k not in self.inner) or (self.inner[k] != expected):
             raise CompareMismatch
-        self.inner[key] = value
+        self.inner[k] = value
 
-    async def compare_and_delete(self, key: str, expected: bytes):
-        if (key not in self.inner) or (self.inner[key] != expected):
+    async def compare_and_delete(self, key: MemKey, expected: bytes):
+        k = _key2str(key)
+        if (k not in self.inner) or (self.inner[k] != expected):
             raise CompareMismatch
-        del self.inner[key]
+        del self.inner[k]
+
+    async def incr(self, k: str) -> int:
+        n = self.inner.get(k, 0) + 1
+        self.inner[k] = n
+        return n

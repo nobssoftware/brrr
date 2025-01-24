@@ -20,6 +20,7 @@ from brrr.backends.redis import RedisStream
 from brrr.backends.dynamo import DynamoDbMemStore
 import brrr
 from brrr import task
+from brrr.codec import PickleCodec
 
 logger = logging.getLogger(__name__)
 routes = web.RouteTableDef()
@@ -107,11 +108,11 @@ async def with_brrr_wrap() -> AsyncIterator[tuple[RedisStream, DynamoDbMemStore]
 
 @asynccontextmanager
 async def with_brrr(reset_backends):
-    async with with_brrr_wrap() as (queue, store):
+    async with with_brrr_wrap() as (redis, dynamo):
         if reset_backends:
-            await queue.setup()
-            await store.create_table()
-        brrr.setup(queue, store)
+            await redis.setup()
+            await dynamo.create_table()
+        brrr.setup(redis, dynamo, redis, PickleCodec())
         yield
 
 
@@ -220,7 +221,7 @@ async def amain():
     if f:
         await f(*sys.argv[2:])
     else:
-        print(f"Usage: brrr_demo.py <{" | ".join(cmds.keys())}>")
+        print(f"Usage: brrr_demo.py <{' | '.join(cmds.keys())}>")
         sys.exit(1)
 
 
