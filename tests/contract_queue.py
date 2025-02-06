@@ -5,13 +5,10 @@ from typing import AsyncIterator
 import pytest
 
 from brrr.queue import Queue, QueueIsEmpty
-from brrr.backends.in_memory import InMemoryQueue
 
 
 class QueueContract(ABC):
-    throws_closes: bool
     has_accurate_info: bool
-    deletes_messages: bool
 
     @abstractmethod
     @asynccontextmanager
@@ -33,15 +30,15 @@ class QueueContract(ABC):
             if self.has_accurate_info:
                 assert (await queue.get_info()).num_messages == 0
 
-            await queue.put("message-1")
+            await queue.put_message("message-1")
             if self.has_accurate_info:
                 assert (await queue.get_info()).num_messages == 1
 
-            await queue.put("message-2")
+            await queue.put_message("message-2")
             if self.has_accurate_info:
                 assert (await queue.get_info()).num_messages == 2
 
-            await queue.put("message-3")
+            await queue.put_message("message-3")
             if self.has_accurate_info:
                 assert (await queue.get_info()).num_messages == 3
 
@@ -65,13 +62,3 @@ class QueueContract(ABC):
 
             with pytest.raises(QueueIsEmpty):
                 await queue.get_message()
-
-
-class TestInMemoryQueue(QueueContract):
-    throws_closes = True
-    has_accurate_info = True
-    deletes_messages = True
-
-    @asynccontextmanager
-    async def with_queue(self) -> AsyncIterator[Queue]:
-        yield InMemoryQueue()

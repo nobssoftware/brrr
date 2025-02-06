@@ -14,21 +14,24 @@ class QueueIsClosed(Exception):
 
 @dataclass
 class Message:
-    body: str
-    receipt_handle: str
+    """Pointless future proof wrapper around getting a queue message.
 
-    def __post_init__(self):
-        assert self.receipt_handle
+    YAGNI and all but something tells me this will be necessary again soon.
+
+    """
+
+    body: str
 
 
 @dataclass
 class QueueInfo:
     """
-    Approximate info about the queue
+    Approximate info about a queue.
+
+    Vestigial and purely  best effort at this point.
     """
 
     num_messages: int
-    num_inflight_messages: int
 
 
 # Infra abstractions
@@ -49,23 +52,6 @@ class Queue(ABC):
     deletes_messages: bool
 
     @abstractmethod
-    async def put(self, body: str): ...
+    async def put_message(self, body: str): ...
     @abstractmethod
     async def get_message(self) -> Message: ...
-    @abstractmethod
-    async def delete_message(self, receipt_handle: str): ...
-    @abstractmethod
-    async def set_message_timeout(self, receipt_handle: str, seconds: int): ...
-    @abstractmethod
-    async def get_info(self) -> QueueInfo: ...
-
-
-class RichQueue(Queue):
-    # Max number of jobs that can be processed concurrently
-    max_concurrency: int
-
-    # Every job requires a token from the pool to be dequeued
-    rate_limit_pool_capacity: int
-
-    # The number of tokens restored to the pool per second
-    replenish_rate_per_second: float

@@ -19,10 +19,7 @@ class InMemoryQueue(Queue):
     messages = collections.deque()
     closed = False
 
-    def __init__(self):
-        self.i = 0
-
-    async def put(self, body: str):
+    async def put_message(self, body: str):
         self.messages.append(body)
 
     async def get_message(self) -> Message:
@@ -30,20 +27,10 @@ class InMemoryQueue(Queue):
             raise QueueIsClosed
         if not self.messages:
             raise QueueIsEmpty
-        self.i += 1
-        return Message(self.messages.popleft(), str(self.i))
-
-    async def delete_message(self, receipt_handle: str):
-        pass
+        return Message(self.messages.popleft())
 
     async def get_info(self):
-        return QueueInfo(
-            num_messages=len(self.messages),
-            num_inflight_messages=0,
-        )
-
-    async def set_message_timeout(self, receipt_handle, seconds):
-        pass
+        return QueueInfo(num_messages=len(self.messages))
 
 
 def _key2str(key: MemKey) -> str:
